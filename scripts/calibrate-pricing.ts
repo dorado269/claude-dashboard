@@ -13,6 +13,7 @@
  */
 
 import { readFileSync, writeFileSync } from 'fs';
+import { validateHeaderName } from 'node:http';
 import { join } from 'path';
 import { deflateSync } from 'zlib';
 import { getClaudeConfigDir } from './utils/config-dir.js';
@@ -37,7 +38,7 @@ interface Options {
   baseUrl: string;
   large: boolean;
   out: string | null;
-  mergeBase: Record<string, unknown>;
+  mergeBase: { settings: Record<string, unknown>; multiplier: number };
   force: boolean;
 }
 
@@ -68,6 +69,7 @@ function parseArgs(argv: string[]): Options {
     console.error(USAGE);
     process.exit(1);
   }
+  validateHeaderName(costHeader);
   const env = settingsEnv();
   const mergeFrom = get('--merge-from');
   return {
@@ -85,12 +87,14 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function readMergeBase(path: string, optional: boolean): Record<string, unknown> {
+function readMergeBase(path: string, optional: boolean): Options['mergeBase'] {
   let raw: string;
   try {
     raw = readFileSync(path, 'utf-8');
   } catch (err) {
-    if (optional && err instanceof Error && 'code' in err && err.code === 'ENOENT') return {};
+    if (optional && err instanceof Error && 'code' in err && err.code === 'ENOENT') {
+      return { settings: {}, multiplier: 1 };
+    }
     throw new Error(`Cannot read managed settings at ${path}`, { cause: err });
   }
   let settings: unknown;
@@ -101,11 +105,15 @@ function readMergeBase(path: string, optional: boolean): Record<string, unknown>
   }
   if (!isObject(settings)) throw new Error(`Expected a JSON object in managed settings at ${path}`);
   const { modelPricing } = settings;
-  if (modelPricing !== undefined && (!isObject(modelPricing) ||
-      (modelPricing.overrides !== undefined && !isObject(modelPricing.overrides)))) {
+  if (modelPricing === undefined) return { settings, multiplier: 1 };
+  if (!isObject(modelPricing) || (modelPricing.overrides !== undefined && !isObject(modelPricing.overrides))) {
     throw new Error(`Expected modelPricing and modelPricing.overrides to be objects in managed settings at ${path}`);
   }
-  return settings;
+  const { multiplier = 1 } = modelPricing;
+  if (typeof multiplier !== 'number' || !(multiplier > 0 && multiplier <= 10)) {
+    throw new Error(`Expected modelPricing.multiplier between 0 (exclusive) and 10 in managed settings at ${path}`);
+  }
+  return { settings, multiplier };
 }
 
 /** Process env layered over the "env" block of the user's settings.json. */
@@ -258,6 +266,24 @@ interface ProbeResult {
   modelId: string;
 }
 
+function isTokenCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isApiUsage(value: unknown): value is ApiUsage {
+  if (!isObject(value) || !isTokenCount(value.input_tokens) || !isTokenCount(value.output_tokens)) {
+    return false;
+  }
+  const { cache_creation, cache_creation_input_tokens, cache_read_input_tokens } = value;
+  return (cache_creation_input_tokens == null || isTokenCount(cache_creation_input_tokens)) &&
+    (cache_read_input_tokens == null || isTokenCount(cache_read_input_tokens)) &&
+    (cache_creation == null || (
+      isObject(cache_creation) &&
+      (cache_creation.ephemeral_5m_input_tokens === undefined || isTokenCount(cache_creation.ephemeral_5m_input_tokens)) &&
+      (cache_creation.ephemeral_1h_input_tokens === undefined || isTokenCount(cache_creation.ephemeral_1h_input_tokens))
+    ));
+}
+
 async function runProbe(opts: Options, headers: Record<string, string>, model: string, p: Probe): Promise<ProbeResult | null> {
   const res = await fetch(`${opts.baseUrl}/v1/messages`, {
     method: 'POST',
@@ -268,15 +294,20 @@ async function runProbe(opts: Options, headers: Record<string, string>, model: s
     console.error(`  ${p.label}: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
     return null;
   }
-  const json = (await res.json()) as { model?: string; usage?: ApiUsage };
+  const json: unknown = await res.json().catch(() => null);
   const raw = res.headers.get(opts.costHeader);
   const cost = parseCostHeader(raw);
-  if (!json.usage || cost === null) {
-    const why = !json.usage ? 'no usage in the response' : raw === null ? `no "${opts.costHeader}" header` : `"${opts.costHeader}" is not a cost: ${JSON.stringify(raw)}`;
+  if (cost === null) {
+    const why = raw === null ? `no "${opts.costHeader}" header` : `"${opts.costHeader}" is not a cost: ${JSON.stringify(raw)}`;
     console.error(`  ${p.label}: ${why}`);
     return null;
   }
-  return { sample: { label: p.label, usage: json.usage, costUsd: cost }, modelId: json.model ?? model };
+  if (!isObject(json) || !isApiUsage(json.usage)) {
+    console.error(`  ${p.label}: response does not contain valid token usage`);
+    return null;
+  }
+  const modelId = typeof json.model === 'string' && json.model.trim() ? json.model : model;
+  return { sample: { label: p.label, usage: json.usage, costUsd: cost }, modelId };
 }
 
 function fmt(n: number | null): string {
@@ -325,9 +356,9 @@ async function main(): Promise<void> {
       ok = false;
       continue;
     }
-    const row = toModelPricingRow(fit.prices);
+    const row = toModelPricingRow(fit.prices, opts.mergeBase.multiplier);
     if (!row) {
-      console.error('  some price kinds were never exercised; skipping');
+      console.error('  fit is missing a required rate or cannot represent it in modelPricing; skipping');
       ok = false;
       continue;
     }
@@ -336,7 +367,7 @@ async function main(): Promise<void> {
   }
 
   if (rows.length > 0) {
-    const merged = JSON.stringify(mergeModelPricing(opts.mergeBase, rows), null, 2) + '\n';
+    const merged = JSON.stringify(mergeModelPricing(opts.mergeBase.settings, rows), null, 2) + '\n';
     if (opts.out) {
       writeFileSync(opts.out, merged);
       console.error(`\nWrote ${opts.out}. Install it as ${MANAGED_SETTINGS} (needs root), then start a new session.`);

@@ -63,6 +63,14 @@ beforeEach(async () => {
     if (probe.model === 'Invalid-Header') res.setHeader('x-mock-cost', 'unknown');
     else if (probe.model !== 'Missing-Header') res.setHeader('x-mock-cost', String(cost));
     res.setHeader('content-type', 'application/json');
+    if (probe.model === 'Invalid-Json') {
+      res.end('{');
+      return;
+    }
+    if (probe.model === 'Invalid-Usage') {
+      res.end(JSON.stringify({ model: apiModel, usage: { input_tokens: '32', output_tokens: 1 } }));
+      return;
+    }
     res.end(JSON.stringify({
       model: apiModel,
       usage: {
@@ -82,12 +90,12 @@ afterEach(async () => {
   rmSync(directory, { recursive: true, force: true });
 });
 
-function runCli(models: string, args: string[] = [], settings = mergeFrom) {
+function runCli(models: string, args: string[] = [], settings = mergeFrom, costHeader = 'x-mock-cost') {
   const port = (server.address() as AddressInfo).port;
   return new Promise<{ code: number | string; stdout: string; stderr: string }>((resolve) => {
     execFile(
       process.execPath,
-      [cli, '--models', models, '--cost-header', 'x-mock-cost', '--base-url', `http://127.0.0.1:${port}`,
+      [cli, '--models', models, '--cost-header', costHeader, '--base-url', `http://127.0.0.1:${port}`,
         '--merge-from', settings, ...args],
       {
         timeout: 4000,
@@ -105,7 +113,14 @@ function runCli(models: string, args: string[] = [], settings = mergeFrom) {
 }
 
 describe('calibrate-pricing CLI', () => {
-  it.each(['Missing-Header', 'Invalid-Header'])('sends just the tiny probe for %s, even with --large', async (model) => {
+  it('rejects an invalid header name before any probe', async () => {
+    const result = await runCli(gatewayModel, [], mergeFrom, 'not a header');
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('not a header');
+    expect(requests).toHaveLength(0);
+  });
+
+  it.each(['Missing-Header', 'Invalid-Header', 'Invalid-Json', 'Invalid-Usage'])('sends just the tiny probe for %s, even with --large', async (model) => {
     const result = await runCli(model, ['--large']);
     expect(result.code).toBe(2);
     expect(result.stdout).toBe('');
@@ -113,7 +128,7 @@ describe('calibrate-pricing CLI', () => {
     expect(requests).toEqual([{ model, max_tokens: 32, messages: [{ role: 'user', content: 'hi' }] }]);
   });
 
-  it.each(['{', '[]', '{"modelPricing":{"overrides":[]}}'])('rejects invalid merge settings before any probe: %s', async (json) => {
+  it.each(['{', '[]', '{"modelPricing":{"overrides":[]}}', '{"modelPricing":{"multiplier":0}}'])('rejects invalid merge settings before any probe: %s', async (json) => {
     writeFileSync(mergeFrom, json);
     const result = await runCli(gatewayModel);
     expect(result.code).toBe(1);
@@ -154,5 +169,22 @@ describe('calibrate-pricing CLI', () => {
     expect(result.stdout).toBe('');
     expect(result.stderr).toContain(`modelPricing.overrides entry: ${JSON.stringify({ [gatewayModel]: expectedRow })}`);
     expect(result.stderr).toContain('ENOENT');
+  });
+
+  it('preserves the existing multiplier and compensates for it in the emitted rates', async () => {
+    writeFileSync(mergeFrom, JSON.stringify({
+      modelPricing: { multiplier: 0.5, overrides: { 'other-model': expectedRow } },
+    }));
+    const result = await runCli(gatewayModel);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      modelPricing: {
+        multiplier: 0.5,
+        overrides: {
+          'other-model': expectedRow,
+          [gatewayModel]: { input: 6, output: 30, cacheRead: 0.6, cacheWrite: 7.5 },
+        },
+      },
+    });
   });
 });

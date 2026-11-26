@@ -17,8 +17,8 @@ export type PriceKind = (typeof PRICE_KINDS)[number];
 export interface ApiUsage {
   input_tokens?: number;
   output_tokens?: number;
-  cache_creation_input_tokens?: number;
-  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
   cache_creation?: {
     ephemeral_5m_input_tokens?: number;
     ephemeral_1h_input_tokens?: number;
@@ -152,14 +152,21 @@ function predictCost(vector: number[], prices: FittedPrices): number {
 
 /**
  * Claude Code's override row has a single cacheWrite rate; it bills 1h writes
- * at that rate too. Use the 5m price, falling back to the 1h price.
+ * at that rate too. Use the 5m price, falling back to the 1h price. Divide by
+ * the configured multiplier, which Claude Code applies to the override.
  */
-export function toModelPricingRow(prices: FittedPrices): ModelPricingRow | null {
+export function toModelPricingRow(prices: FittedPrices, multiplier = 1): ModelPricingRow | null {
   const cacheWrite = prices.cacheWrite5m ?? prices.cacheWrite1h;
   if (prices.input === null || prices.output === null || prices.cacheRead === null || cacheWrite === null) {
     return null;
   }
-  return { input: prices.input, output: prices.output, cacheRead: prices.cacheRead, cacheWrite };
+  const row = {
+    input: prices.input / multiplier,
+    output: prices.output / multiplier,
+    cacheRead: prices.cacheRead / multiplier,
+    cacheWrite: cacheWrite / multiplier,
+  };
+  return Object.values(row).every((rate) => Number.isFinite(rate) && rate >= 0 && rate <= 10_000) ? row : null;
 }
 
 /**
@@ -180,10 +187,21 @@ export function mergeModelPricing(
 ): Record<string, unknown> {
   const current = (settings.modelPricing ?? {}) as { overrides?: Record<string, ModelPricingRow> };
   const overrides = new Map(Object.entries(current.overrides ?? {}));
+  const aliases = new Map<string, ModelPricingRow | null>();
   for (const { modelId, row } of rows) {
-    for (const key of overrideKeys(modelId)) overrides.set(key, row);
+    for (const key of overrideKeys(modelId)) {
+      const previous = aliases.get(key);
+      if (previous === undefined) aliases.set(key, row);
+      else if (previous && (previous.input !== row.input || previous.output !== row.output ||
+          previous.cacheRead !== row.cacheRead || previous.cacheWrite !== row.cacheWrite)) {
+        aliases.set(key, null);
+      }
+    }
   }
-  // Gateway deployments may report the same API model ID at different rates.
+  // Only write inferred keys that agree across all calibrated deployments.
+  for (const [key, row] of aliases) {
+    if (row !== null) overrides.set(key, row);
+  }
   for (const { requestedModel, row } of rows) overrides.set(requestedModel, row);
   return { ...settings, modelPricing: { ...current, overrides: Object.fromEntries(overrides) } };
 }

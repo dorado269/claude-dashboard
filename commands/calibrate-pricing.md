@@ -51,7 +51,7 @@ console.log(path.join(cacheRoot, versions[versions.length - 1], "dist/calibrate-
 ')" && node "$SCRIPT" $ARGUMENTS
 ```
 
-The fit report and fitted override entries go to stderr. The merged managed-settings JSON goes to stdout (or `--out`). Exit code 2 means at least one model was skipped because its preflight failed, the collected samples could not supply all required prices, or the fit failed its residual check. Successful models still appear in the output.
+The fit report and generated override entries go to stderr. The merged managed-settings JSON goes to stdout (or `--out`). The generated entries account for any existing `modelPricing.multiplier`. Exit code 2 means at least one model was skipped because its preflight failed, its fit failed the residual check, or its rates could not be represented in managed settings. Successful models still appear in the output.
 
 ### 3. Install
 

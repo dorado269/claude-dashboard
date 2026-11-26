@@ -2,6 +2,7 @@
 
 // scripts/calibrate-pricing.ts
 import { readFileSync, writeFileSync } from "fs";
+import { validateHeaderName } from "node:http";
 import { join as join2 } from "path";
 import { deflateSync } from "zlib";
 
@@ -86,12 +87,18 @@ function roundPrice(v) {
 function predictCost(vector, prices) {
   return PRICE_KINDS.reduce((acc, k, i) => acc + vector[i] * (prices[k] ?? 0), 0) / 1e6;
 }
-function toModelPricingRow(prices) {
+function toModelPricingRow(prices, multiplier = 1) {
   const cacheWrite = prices.cacheWrite5m ?? prices.cacheWrite1h;
   if (prices.input === null || prices.output === null || prices.cacheRead === null || cacheWrite === null) {
     return null;
   }
-  return { input: prices.input, output: prices.output, cacheRead: prices.cacheRead, cacheWrite };
+  const row = {
+    input: prices.input / multiplier,
+    output: prices.output / multiplier,
+    cacheRead: prices.cacheRead / multiplier,
+    cacheWrite: cacheWrite / multiplier
+  };
+  return Object.values(row).every((rate) => Number.isFinite(rate) && rate >= 0 && rate <= 1e4) ? row : null;
 }
 function overrideKeys(modelId) {
   const id = modelId.toLowerCase().replace(/(?:\[[^\]]*\])+$/, "").replace(/-\d{8}$/, "");
@@ -102,8 +109,19 @@ function overrideKeys(modelId) {
 function mergeModelPricing(settings, rows) {
   const current = settings.modelPricing ?? {};
   const overrides = new Map(Object.entries(current.overrides ?? {}));
+  const aliases = /* @__PURE__ */ new Map();
   for (const { modelId, row } of rows) {
-    for (const key of overrideKeys(modelId))
+    for (const key of overrideKeys(modelId)) {
+      const previous = aliases.get(key);
+      if (previous === void 0)
+        aliases.set(key, row);
+      else if (previous && (previous.input !== row.input || previous.output !== row.output || previous.cacheRead !== row.cacheRead || previous.cacheWrite !== row.cacheWrite)) {
+        aliases.set(key, null);
+      }
+    }
+  }
+  for (const [key, row] of aliases) {
+    if (row !== null)
       overrides.set(key, row);
   }
   for (const { requestedModel, row } of rows)
@@ -142,6 +160,7 @@ function parseArgs(argv) {
     console.error(USAGE);
     process.exit(1);
   }
+  validateHeaderName(costHeader);
   const env = settingsEnv();
   const mergeFrom = get("--merge-from");
   return {
@@ -162,8 +181,9 @@ function readMergeBase(path, optional) {
   try {
     raw = readFileSync(path, "utf-8");
   } catch (err) {
-    if (optional && err instanceof Error && "code" in err && err.code === "ENOENT")
-      return {};
+    if (optional && err instanceof Error && "code" in err && err.code === "ENOENT") {
+      return { settings: {}, multiplier: 1 };
+    }
     throw new Error(`Cannot read managed settings at ${path}`, { cause: err });
   }
   let settings;
@@ -175,10 +195,16 @@ function readMergeBase(path, optional) {
   if (!isObject(settings))
     throw new Error(`Expected a JSON object in managed settings at ${path}`);
   const { modelPricing } = settings;
-  if (modelPricing !== void 0 && (!isObject(modelPricing) || modelPricing.overrides !== void 0 && !isObject(modelPricing.overrides))) {
+  if (modelPricing === void 0)
+    return { settings, multiplier: 1 };
+  if (!isObject(modelPricing) || modelPricing.overrides !== void 0 && !isObject(modelPricing.overrides)) {
     throw new Error(`Expected modelPricing and modelPricing.overrides to be objects in managed settings at ${path}`);
   }
-  return settings;
+  const { multiplier = 1 } = modelPricing;
+  if (typeof multiplier !== "number" || !(multiplier > 0 && multiplier <= 10)) {
+    throw new Error(`Expected modelPricing.multiplier between 0 (exclusive) and 10 in managed settings at ${path}`);
+  }
+  return { settings, multiplier };
 }
 function settingsEnv() {
   let fromSettings = {};
@@ -315,6 +341,16 @@ Reply OK.`) } },
   }
   return list;
 }
+function isTokenCount(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+function isApiUsage(value) {
+  if (!isObject(value) || !isTokenCount(value.input_tokens) || !isTokenCount(value.output_tokens)) {
+    return false;
+  }
+  const { cache_creation, cache_creation_input_tokens, cache_read_input_tokens } = value;
+  return (cache_creation_input_tokens == null || isTokenCount(cache_creation_input_tokens)) && (cache_read_input_tokens == null || isTokenCount(cache_read_input_tokens)) && (cache_creation == null || isObject(cache_creation) && (cache_creation.ephemeral_5m_input_tokens === void 0 || isTokenCount(cache_creation.ephemeral_5m_input_tokens)) && (cache_creation.ephemeral_1h_input_tokens === void 0 || isTokenCount(cache_creation.ephemeral_1h_input_tokens)));
+}
 async function runProbe(opts, headers, model, p) {
   const res = await fetch(`${opts.baseUrl}/v1/messages`, {
     method: "POST",
@@ -325,15 +361,20 @@ async function runProbe(opts, headers, model, p) {
     console.error(`  ${p.label}: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
     return null;
   }
-  const json = await res.json();
+  const json = await res.json().catch(() => null);
   const raw = res.headers.get(opts.costHeader);
   const cost = parseCostHeader(raw);
-  if (!json.usage || cost === null) {
-    const why = !json.usage ? "no usage in the response" : raw === null ? `no "${opts.costHeader}" header` : `"${opts.costHeader}" is not a cost: ${JSON.stringify(raw)}`;
+  if (cost === null) {
+    const why = raw === null ? `no "${opts.costHeader}" header` : `"${opts.costHeader}" is not a cost: ${JSON.stringify(raw)}`;
     console.error(`  ${p.label}: ${why}`);
     return null;
   }
-  return { sample: { label: p.label, usage: json.usage, costUsd: cost }, modelId: json.model ?? model };
+  if (!isObject(json) || !isApiUsage(json.usage)) {
+    console.error(`  ${p.label}: response does not contain valid token usage`);
+    return null;
+  }
+  const modelId = typeof json.model === "string" && json.model.trim() ? json.model : model;
+  return { sample: { label: p.label, usage: json.usage, costUsd: cost }, modelId };
 }
 function fmt(n) {
   return n === null ? "-" : String(n);
@@ -381,9 +422,9 @@ ${model}: probing ${opts.baseUrl}`);
       ok = false;
       continue;
     }
-    const row = toModelPricingRow(fit.prices);
+    const row = toModelPricingRow(fit.prices, opts.mergeBase.multiplier);
     if (!row) {
-      console.error("  some price kinds were never exercised; skipping");
+      console.error("  fit is missing a required rate or cannot represent it in modelPricing; skipping");
       ok = false;
       continue;
     }
@@ -391,7 +432,7 @@ ${model}: probing ${opts.baseUrl}`);
     rows.push({ requestedModel: model, modelId, row });
   }
   if (rows.length > 0) {
-    const merged = JSON.stringify(mergeModelPricing(opts.mergeBase, rows), null, 2) + "\n";
+    const merged = JSON.stringify(mergeModelPricing(opts.mergeBase.settings, rows), null, 2) + "\n";
     if (opts.out) {
       writeFileSync(opts.out, merged);
       console.error(`

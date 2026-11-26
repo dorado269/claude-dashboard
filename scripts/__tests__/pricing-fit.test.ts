@@ -91,6 +91,12 @@ describe('toModelPricingRow', () => {
   it('returns null when a required kind is missing', () => {
     expect(toModelPricingRow({ input: 1, output: 2, cacheWrite5m: 3, cacheWrite1h: null, cacheRead: null })).toBeNull();
   });
+
+  it('rejects rates outside the managed-settings range after scaling', () => {
+    const prices = { input: 5001, output: 2, cacheWrite5m: 3, cacheWrite1h: null, cacheRead: 0 };
+    expect(toModelPricingRow(prices, 0.5)).toBeNull();
+    expect(toModelPricingRow({ ...prices, input: -1 })).toBeNull();
+  });
 });
 
 describe('overrideKeys', () => {
@@ -133,11 +139,17 @@ describe('mergeModelPricing', () => {
     const row = { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1.25 };
     const otherRow = { ...row, input: 3 };
     const modelId = 'claude-opus-5-5';
-    const merged = mergeModelPricing({}, [
+    const rows = [
       { requestedModel: 'claude-opus-5.5', modelId, row },
       { requestedModel: 'Claude-Gateway[1m]', modelId, row: otherRow },
-    ]);
-    expect(merged.modelPricing).toMatchObject({
+    ];
+    const existing = { modelPricing: { overrides: { [modelId]: row } } };
+    const expected = {
+      overrides: { [modelId]: row, 'claude-opus-5.5': row, 'Claude-Gateway[1m]': otherRow },
+    };
+    expect(mergeModelPricing(existing, rows).modelPricing).toEqual(expected);
+    expect(mergeModelPricing(existing, [...rows].reverse()).modelPricing).toEqual(expected);
+    expect(mergeModelPricing({}, rows).modelPricing).toEqual({
       overrides: { 'claude-opus-5.5': row, 'Claude-Gateway[1m]': otherRow },
     });
   });
