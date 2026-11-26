@@ -21,6 +21,8 @@ For API gateways that bill at contracted rates and return each request's cost in
 
 Every probe is a real, billed request: a few cents per model by default, roughly $1-$10 per model with `--large`. If the user did not give `--models` and `--cost-header`, ask for them; the header name is gateway-specific.
 
+Use `ANTHROPIC_BASE_URL` or `--base-url` to point at the gateway. The script validates the managed settings or `--merge-from` file before probing. Each model starts with one tiny billed request. If the response lacks usable cost or usage data, the script skips the remaining probes for that model.
+
 ### 2. Find plugin path and run the script
 
 ```bash
@@ -49,11 +51,11 @@ console.log(path.join(cacheRoot, versions[versions.length - 1], "dist/calibrate-
 ')" && node "$SCRIPT" $ARGUMENTS
 ```
 
-The fit report goes to stderr; the merged managed-settings JSON goes to stdout (or `--out`). Exit code 2 means at least one model was skipped: a probe failed, a price kind was never exercised, or the reported costs are not linear in the token counts (the gateway bills something else, e.g. a long-context tier).
+The fit report and fitted override entries go to stderr. The merged managed-settings JSON goes to stdout (or `--out`). Exit code 2 means at least one model was skipped because its preflight failed, the collected samples could not supply all required prices, or the fit failed its residual check. Successful models still appear in the output.
 
 ### 3. Install
 
-`modelPricing` is honored only from managed settings. Show the user the JSON and, only with their approval, install it:
+Deploy [`modelPricing`](https://code.claude.com/docs/en/settings-reference#modelpricing) through Claude Code managed settings. Show the user the JSON and, only with their approval, install it:
 
 ```bash
 sudo install -m 0644 /tmp/managed-settings.json /etc/claude-code/managed-settings.json

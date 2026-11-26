@@ -233,14 +233,16 @@ check-ai --json   # JSON output for scripting
 
 ### `/claude-dashboard:calibrate-pricing`
 
-For API gateways that bill at contracted rates and report each request's cost in a response header. Sends a small set of billed probe requests per model (input, output, thinking, 5m/1h cache write, cache read, mixed, image), fits a per-token price to every kind, checks the fit reproduces each request's reported cost, and prints Claude Code's `modelPricing` managed setting. Once installed, `/cost` and every cost widget here (`cost`, `todayCost`, `budget`, `forecast`) use those rates.
+For API gateways that bill at contracted rates and report each request's cost in a response header. The command fits token rates from billed probes covering input, output, and cache reads and writes. The probes include a reasoning prompt, mixed cache usage, and an image. The command checks the fit against each measured cost and prints Claude Code's `modelPricing` managed setting. Once installed, `/cost` and the cost widgets (`cost`, `todayCost`, `budget`, `forecast`) use those rates.
 
 ```bash
 /claude-dashboard:calibrate-pricing --models <model,model> --cost-header <header-name>
 /claude-dashboard:calibrate-pricing --models <model> --cost-header <header-name> --large   # also probe >200K prompts
 ```
 
-Claude Code reads `modelPricing` only from managed settings (`/etc/claude-code/managed-settings.json` on Linux), not from user or project settings, so installing the result needs root. Its override rows have a single `cacheWrite` rate (1h cache writes are billed at it) and it adds its own per-request web search charge, which a gateway may not bill.
+Set `ANTHROPIC_BASE_URL` (or pass `--base-url`) to point at your gateway. The command validates the existing managed settings or `--merge-from` file before sending requests. For each model it starts with one tiny billed request and skips that model's remaining probes if the response lacks usable cost or usage data. The output keeps the exact model names supplied in `--models`, including case and suffixes.
+
+Review the generated JSON before having an administrator deploy it as managed settings (`/etc/claude-code/managed-settings.json` on Linux). Claude Code applies any existing `modelPricing.multiplier` on top of the overrides. Its override rows have a single `cacheWrite` rate for both cache lifetimes, and it adds its own per-request web search charge, which a gateway may not bill. See the [Claude Code `modelPricing` reference](https://code.claude.com/docs/en/settings-reference#modelpricing) for the schema and supported managed settings sources.
 
 ### `/claude-dashboard:update`
 

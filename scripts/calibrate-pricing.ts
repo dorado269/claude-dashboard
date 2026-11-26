@@ -9,9 +9,10 @@
  * model at list-like prices; --large adds >200K-token prompts (roughly $1-$10
  * per model) to check that cost stays linear at long context.
  * @tested scripts/__tests__/pricing-fit.test.ts
+ * @tested scripts/__tests__/calibrate-pricing.test.ts
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { deflateSync } from 'zlib';
 import { getClaudeConfigDir } from './utils/config-dir.js';
@@ -23,8 +24,8 @@ import {
   usageVector,
   PRICE_KINDS,
   type ApiUsage,
+  type CalibrationRow,
   type CostSample,
-  type ModelPricingRow,
 } from './utils/pricing-fit.js';
 
 const MANAGED_SETTINGS = '/etc/claude-code/managed-settings.json';
@@ -36,7 +37,7 @@ interface Options {
   baseUrl: string;
   large: boolean;
   out: string | null;
-  mergeFrom: string | null;
+  mergeBase: Record<string, unknown>;
   force: boolean;
 }
 
@@ -56,7 +57,10 @@ read from the environment or, when unset there, from the "env" block of settings
 function parseArgs(argv: string[]): Options {
   const get = (flag: string): string | null => {
     const i = argv.indexOf(flag);
-    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
+    if (i < 0) return null;
+    const value = argv[i + 1];
+    if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+    return value;
   };
   const models = (get('--models') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
   const costHeader = get('--cost-header');
@@ -65,15 +69,43 @@ function parseArgs(argv: string[]): Options {
     process.exit(1);
   }
   const env = settingsEnv();
+  const mergeFrom = get('--merge-from');
   return {
     models,
     costHeader: costHeader.toLowerCase(),
     baseUrl: (get('--base-url') ?? env.ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com').replace(/\/+$/, ''),
     large: argv.includes('--large'),
     out: get('--out'),
-    mergeFrom: get('--merge-from') ?? (existsSync(MANAGED_SETTINGS) ? MANAGED_SETTINGS : null),
+    mergeBase: readMergeBase(mergeFrom ?? MANAGED_SETTINGS, mergeFrom === null),
     force: argv.includes('--force'),
   };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readMergeBase(path: string, optional: boolean): Record<string, unknown> {
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf-8');
+  } catch (err) {
+    if (optional && err instanceof Error && 'code' in err && err.code === 'ENOENT') return {};
+    throw new Error(`Cannot read managed settings at ${path}`, { cause: err });
+  }
+  let settings: unknown;
+  try {
+    settings = JSON.parse(raw);
+  } catch {
+    throw new Error(`Invalid JSON in managed settings at ${path}`);
+  }
+  if (!isObject(settings)) throw new Error(`Expected a JSON object in managed settings at ${path}`);
+  const { modelPricing } = settings;
+  if (modelPricing !== undefined && (!isObject(modelPricing) ||
+      (modelPricing.overrides !== undefined && !isObject(modelPricing.overrides)))) {
+    throw new Error(`Expected modelPricing and modelPricing.overrides to be objects in managed settings at ${path}`);
+  }
+  return settings;
 }
 
 /** Process env layered over the "env" block of the user's settings.json. */
@@ -159,24 +191,23 @@ interface Probe {
 }
 
 const ask = (text: string) => [{ role: 'user', content: text }];
+const tinyProbe: Probe = { label: 'tiny', body: { max_tokens: 32, messages: ask('hi') } };
 
 /**
- * Probes chosen so every price kind appears alone at least once (separable)
- * and once mixed with others (cross-check): plain input at two sizes, output,
- * a reasoning prompt (thinking tokens), 5m and 1h cache write + read, a mixed
- * read/write/uncached request, an image, and optionally long prompts.
+ * Vary token counts to separate the rates and cross-check mixed samples.
+ * Includes two input sizes, output, a reasoning prompt, cache write and read
+ * at both TTLs, mixed cache usage, an image, and optional long prompts.
  */
 function probes(nonce: string, large: boolean): Probe[] {
   const small = { max_tokens: 32 };
   const sys5m = [{ type: 'text', text: filler(4000, `${nonce}c5`), cache_control: { type: 'ephemeral' } }];
   const sys1h = [{ type: 'text', text: filler(4000, `${nonce}c1`), cache_control: { type: 'ephemeral', ttl: '1h' } }];
   const list: Probe[] = [
-    { label: 'tiny', body: { ...small, messages: ask('hi') } },
     { label: 'input ~16K', body: { ...small, messages: ask(`${filler(3000, `${nonce}i1`)}\nReply OK.`) } },
     { label: 'input ~47K', body: { ...small, messages: ask(`${filler(9000, `${nonce}i2`)}\nReply OK.`) } },
     { label: 'output', body: { max_tokens: 3000, messages: ask('Write a 500-word story about a lighthouse.') } },
     {
-      label: 'thinking',
+      label: 'reasoning',
       body: {
         max_tokens: 8000,
         messages: ask('How many integers 1..10000 are divisible by 3 or 7 but not 21? Answer with the number.'),
@@ -255,13 +286,19 @@ function fmt(n: number | null): string {
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2));
   const headers = authHeaders();
-  const rows: Record<string, ModelPricingRow> = {};
+  const rows: CalibrationRow[] = [];
   let ok = true;
 
   for (const model of opts.models) {
     console.error(`\n${model}: probing ${opts.baseUrl}`);
+    const preflight = await runProbe(opts, headers, model, tinyProbe);
+    if (!preflight) {
+      console.error('  tiny preflight failed; skipping the remaining probes for this model');
+      ok = false;
+      continue;
+    }
     const nonce = `${model}-${Date.now()}`;
-    const results: ProbeResult[] = [];
+    const results = [preflight];
     for (const p of probes(nonce, opts.large)) {
       const r = await runProbe(opts, headers, model, p);
       if (r) results.push(r);
@@ -272,7 +309,7 @@ async function main(): Promise<void> {
       ok = false;
       continue;
     }
-    const modelId = results[0].modelId;
+    const modelId = preflight.modelId;
     console.error(`  model id: ${modelId}`);
     console.error(`  $/1M tokens: ${PRICE_KINDS.map((k) => `${k}=${fmt(fit.prices[k])}`).join('  ')}`);
     for (const [i, r] of fit.residuals.entries()) {
@@ -294,12 +331,12 @@ async function main(): Promise<void> {
       ok = false;
       continue;
     }
-    rows[modelId] = row;
+    console.error(`  modelPricing.overrides entry: ${JSON.stringify({ [model]: row })}`);
+    rows.push({ requestedModel: model, modelId, row });
   }
 
-  if (Object.keys(rows).length > 0) {
-    const base = opts.mergeFrom ? JSON.parse(readFileSync(opts.mergeFrom, 'utf-8')) : {};
-    const merged = JSON.stringify(mergeModelPricing(base, rows), null, 2) + '\n';
+  if (rows.length > 0) {
+    const merged = JSON.stringify(mergeModelPricing(opts.mergeBase, rows), null, 2) + '\n';
     if (opts.out) {
       writeFileSync(opts.out, merged);
       console.error(`\nWrote ${opts.out}. Install it as ${MANAGED_SETTINGS} (needs root), then start a new session.`);
@@ -307,10 +344,10 @@ async function main(): Promise<void> {
       process.stdout.write(merged);
     }
   }
-  process.exit(ok ? 0 : 2);
+  process.exitCode = ok ? 0 : 2;
 }
 
 main().catch((err: unknown) => {
   console.error('Error:', err instanceof Error ? err.message : String(err));
-  process.exit(1);
+  process.exitCode = 1;
 });

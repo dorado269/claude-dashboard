@@ -101,6 +101,18 @@ describe('overrideKeys', () => {
   it('handles IDs without a minor version', () => {
     expect(overrideKeys('claude-sonnet-5')).toEqual(['claude-sonnet-5', 'claude-sonnet-5[1m]']);
   });
+
+  it('keeps the exact dated API ID and derives variants without the snapshot date', () => {
+    expect(overrideKeys('claude-sonnet-4-5-20250929')).toEqual([
+      'claude-sonnet-4-5-20250929', 'claude-sonnet-4-5', 'claude-sonnet-4.5', 'claude-sonnet-4.5[1m]',
+    ]);
+  });
+
+  it('keeps the exact context-suffixed ID without duplicating the suffix', () => {
+    expect(overrideKeys('Claude-Opus-5.5[1m]')).toEqual([
+      'Claude-Opus-5.5[1m]', 'claude-opus-5-5', 'claude-opus-5.5', 'claude-opus-5.5[1m]',
+    ]);
+  });
 });
 
 describe('mergeModelPricing', () => {
@@ -108,12 +120,25 @@ describe('mergeModelPricing', () => {
     const row = { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1.25 };
     const merged = mergeModelPricing(
       { permissions: { deny: ['x'] }, modelPricing: { multiplier: 1, overrides: { other: row } } },
-      { 'claude-sonnet-5': row }
+      [{ requestedModel: 'My-Sonnet', modelId: 'claude-sonnet-5', row }]
     );
     expect(merged.permissions).toEqual({ deny: ['x'] });
     expect(merged.modelPricing).toEqual({
       multiplier: 1,
-      overrides: { other: row, 'claude-sonnet-5': row, 'claude-sonnet-5[1m]': row },
+      overrides: { other: row, 'claude-sonnet-5': row, 'claude-sonnet-5[1m]': row, 'My-Sonnet': row },
+    });
+  });
+
+  it('preserves distinct gateway rates when deployments share the same response model ID', () => {
+    const row = { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1.25 };
+    const otherRow = { ...row, input: 3 };
+    const modelId = 'claude-opus-5-5';
+    const merged = mergeModelPricing({}, [
+      { requestedModel: 'claude-opus-5.5', modelId, row },
+      { requestedModel: 'Claude-Gateway[1m]', modelId, row: otherRow },
+    ]);
+    expect(merged.modelPricing).toMatchObject({
+      overrides: { 'claude-opus-5.5': row, 'Claude-Gateway[1m]': otherRow },
     });
   });
 });

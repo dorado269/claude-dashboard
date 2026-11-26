@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-claude-dashboard는 4개의 커맨드를 제공합니다.
+claude-dashboard는 설정, 사용량 확인, 요금 보정, 셸 연동, 업데이트를 위한 커맨드를 제공합니다.
 
 ## /claude-dashboard:setup
 
@@ -75,6 +75,18 @@ claude-dashboard는 4개의 커맨드를 제공합니다.
 - **z.ai**: 토큰 및 MCP 사용량 (설정된 경우)
 
 하단에 현재 사용량이 가장 낮은 CLI를 추천합니다.
+
+## /claude-dashboard:calibrate-pricing
+
+요청별 비용을 응답 헤더에 담아 보내는 Anthropic 호환 게이트웨이의 토큰 단가를 추정합니다. 추정한 단가는 [Claude Code의 `modelPricing` 관리형 설정](https://code.claude.com/docs/en/settings-reference#modelpricing)으로 출력되며, 비용을 계약 단가 기준으로 표시하는 데 사용됩니다.
+
+```bash
+/claude-dashboard:calibrate-pricing --models <model,model> --cost-header <header-name>
+```
+
+`ANTHROPIC_BASE_URL`을 설정하거나 `--base-url`로 게이트웨이를 지정하세요. 모든 테스트 요청에는 요금이 부과됩니다. 커맨드는 요청을 보내기 전에 관리형 설정 파일을 검증하고, 모델마다 작은 요청을 한 번 먼저 보냅니다. 이 응답에서 비용이나 사용량을 확인할 수 없으면 해당 모델의 나머지 요청을 건너뜁니다. `--large`를 지정하면 20만 토큰을 넘는 프롬프트가 추가되어 비용이 크게 늘어날 수 있습니다.
+
+`--merge-from <file>`로 병합할 기존 설정 파일을 지정하고, `--out <file>`로 생성된 JSON을 저장할 수 있습니다. 결과를 확인한 뒤 관리자에게 관리형 설정으로 배포해 달라고 요청하세요.
 
 ## /claude-dashboard:setup-alias
 

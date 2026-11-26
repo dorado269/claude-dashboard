@@ -19,7 +19,8 @@ claude-dashboard/
 │   ├── plugin.json          # Plugin manifest
 │   └── marketplace.json     # Marketplace metadata
 ├── commands/
-│   ├── setup.md             # /claude-dashboard:setup command
+│   ├── calibrate-pricing.md # /claude-dashboard:calibrate-pricing command
+│   ├── setup.md            # /claude-dashboard:setup command
 │   └── check-usage.md       # /claude-dashboard:check-usage command
 ├── hooks/
 │   ├── hooks.json           # SessionStart hook registration
@@ -28,6 +29,7 @@ claude-dashboard/
 │   ├── statusline-shim.mjs  # Version-agnostic entry point (copied to PLUGIN_DATA)
 │   ├── statusline.ts        # Main entry point (status line)
 │   ├── check-usage.ts       # CLI usage dashboard entry point
+│   ├── calibrate-pricing.ts # Gateway pricing calibration CLI entry point
 │   ├── mod/
 │   │   ├── register.tsx     # Mod entry: /claude-dashboard-pane pane + /claude-dashboard-band band
 │   │   ├── stdin-builder.ts # Builds renderer stdin from mod API state
@@ -87,6 +89,7 @@ claude-dashboard/
 │       ├── credentials.ts   # Keychain/credentials extraction (60s backoff on failure)
 │       ├── debug.ts         # Debug utilities
 │       ├── formatters.ts    # Token/cost/time/duration formatting
+│       ├── pricing-fit.ts   # Token price fitting and managed-settings merge
 │       ├── hash.ts          # Token hashing for cache keys
 │       ├── i18n.ts          # Internationalization
 │       ├── progress-bar.ts  # Progress bar rendering
@@ -104,6 +107,7 @@ claude-dashboard/
 ├── dist/
 │   ├── index.js             # Status line built output (committed)
 │   ├── check-usage.js       # CLI usage dashboard built output (committed)
+│   ├── calibrate-pricing.js # Pricing calibration built output (committed)
 │   └── mod.js               # Mod (/claude-dashboard-pane, /claude-dashboard-band) built output (committed)
 └── package.json
 ```

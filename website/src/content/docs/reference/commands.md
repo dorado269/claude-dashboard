@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-claude-dashboard provides six commands for setup, usage checking, shell integration, and updating.
+claude-dashboard provides commands for setup, usage checking, pricing calibration, shell integration, and updating.
 
 ## /claude-dashboard:setup
 
@@ -70,6 +70,18 @@ Shows usage for each installed CLI:
 - **z.ai**: Token and MCP usage with model info (if configured)
 
 At the bottom, recommends the CLI with the lowest current usage.
+
+## /claude-dashboard:calibrate-pricing
+
+Fit token prices for an Anthropic-compatible gateway that reports each request's cost in a response header. The result is a [Claude Code `modelPricing` managed setting](https://code.claude.com/docs/en/settings-reference#modelpricing) for contracted-rate cost estimates.
+
+```bash
+/claude-dashboard:calibrate-pricing --models <model,model> --cost-header <header-name>
+```
+
+Set `ANTHROPIC_BASE_URL` or pass `--base-url` to select the gateway. Every probe is billed. The command validates the managed settings file before sending requests and starts each model with a tiny probe. If that response lacks usable cost or usage data, the remaining probes for that model are skipped. `--large` adds prompts over 200K tokens and can increase the cost substantially.
+
+Use `--merge-from <file>` to select an existing settings file and `--out <file>` to save the generated JSON. Review the result before asking an administrator to deploy it as managed settings.
 
 ## /claude-dashboard:setup-alias
 

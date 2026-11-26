@@ -56,6 +56,12 @@ export interface ModelPricingRow {
   cacheWrite: number;
 }
 
+export interface CalibrationRow {
+  requestedModel: string;
+  modelId: string;
+  row: ModelPricingRow;
+}
+
 const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0);
 
 /**
@@ -157,26 +163,27 @@ export function toModelPricingRow(prices: FittedPrices): ModelPricingRow | null 
 }
 
 /**
- * Override keys to write for a model ID returned by the API. Claude Code
- * matches overrides by the model string the session uses, which behind a
- * gateway may be a deployment name like `Claude-Opus-5.5[1m]` rather than the
- * API ID `claude-opus-5-5`; also list the dotted and `[1m]` spellings.
+ * Keep the exact API ID and derive common spellings from the versioned ID
+ * without its snapshot date or context suffix.
  */
 export function overrideKeys(modelId: string): string[] {
-  const id = modelId.toLowerCase();
+  const id = modelId.toLowerCase().replace(/(?:\[[^\]]*\])+$/, '').replace(/-\d{8}$/, '');
   const dotted = id.replace(/-(\d+)-(\d+)$/, '-$1.$2');
-  return [...new Set([id, dotted, `${dotted}[1m]`])];
+  const dashed = dotted.replace(/-(\d+)\.(\d+)$/, '-$1-$2');
+  return [...new Set([modelId, dashed, dotted, `${dotted}[1m]`])];
 }
 
 /** Merge rows into an existing managed-settings object without touching other keys. */
 export function mergeModelPricing(
   settings: Record<string, unknown>,
-  rows: Record<string, ModelPricingRow>
+  rows: CalibrationRow[]
 ): Record<string, unknown> {
   const current = (settings.modelPricing ?? {}) as { overrides?: Record<string, ModelPricingRow> };
-  const overrides = { ...(current.overrides ?? {}) };
-  for (const [model, row] of Object.entries(rows)) {
-    for (const key of overrideKeys(model)) overrides[key] = row;
+  const overrides = new Map(Object.entries(current.overrides ?? {}));
+  for (const { modelId, row } of rows) {
+    for (const key of overrideKeys(modelId)) overrides.set(key, row);
   }
-  return { ...settings, modelPricing: { ...current, overrides } };
+  // Gateway deployments may report the same API model ID at different rates.
+  for (const { requestedModel, row } of rows) overrides.set(requestedModel, row);
+  return { ...settings, modelPricing: { ...current, overrides: Object.fromEntries(overrides) } };
 }
